@@ -2,222 +2,404 @@
 
 namespace ZohoMail\LaravelZeptoMail\Transport;
 
-use Psr\Http\Message\ResponseInterface;
+use GuzzleHttp\Client as HttpClient;
+use GuzzleHttp\Exception\ConnectException as GuzzleConnectException;
+use GuzzleHttp\Exception\RequestException;
+use Illuminate\Support\Facades\Log;
+use Psr\Log\LoggerInterface;
 use Symfony\Component\Mailer\Envelope;
-use Symfony\Component\Mailer\Exception\TransportException;
-use Symfony\Component\Mailer\Exception\TransportExceptionInterface;
 use Symfony\Component\Mailer\SentMessage;
 use Symfony\Component\Mailer\Transport\TransportInterface;
-use Symfony\Component\Mime\Part\DataPart;
-use Symfony\Component\Mime\RawMessage;
+use Symfony\Component\Mime\Address;
 use Symfony\Component\Mime\Email;
 use Symfony\Component\Mime\MessageConverter;
-use GuzzleHttp\Client as HttpClient;
-use GuzzleHttp\Exception\RequestException;
-use GuzzleHttp\Exception\ConnectException;
-use Illuminate\Support\Facades\Log;
-use function json_decode;
+use Symfony\Component\Mime\RawMessage;
+use ZohoMail\LaravelZeptoMail\Exceptions\ApiException;
+use ZohoMail\LaravelZeptoMail\Exceptions\ConfigurationException;
+use ZohoMail\LaravelZeptoMail\Exceptions\ConnectionException;
 
 class ZeptoMailTransport implements TransportInterface
 {
-    protected string $apikey;
-    protected string $host;
+    protected string $apiKey;
+    protected string $endpoint;
+    protected int $timeout;
+    protected bool $loggingEnabled;
     protected HttpClient $client;
+    protected ?LoggerInterface $logger = null;
 
-    public function __construct(string $apikey, string $host)
-    {
-        $this->apikey = $apikey;
-        $this->host = $host;
-        $this->client = new HttpClient();
+    /**
+     * @throws ConfigurationException
+     */
+    public function __construct(
+        string $apiKey,
+        ?string $region = null,
+        ?string $customEndpoint = null,
+        ?string $apiVersion = null,
+        ?int $timeout = null,
+        ?bool $loggingEnabled = null,
+        ?array $regionDomains = null
+    ) {
+        $this->validateApiKey($apiKey);
+
+        $this->apiKey = $apiKey;
+        $this->endpoint = $this->resolveEndpoint($region, $customEndpoint, $apiVersion, $regionDomains);
+        $this->timeout = $timeout ?? 30;
+        $this->loggingEnabled = $loggingEnabled ?? false;
+
+        $this->client = new HttpClient([
+            'timeout' => $this->timeout,
+            'http_errors' => false,
+        ]);
     }
 
+    /**
+     * Set custom logger instance
+     */
+    public function setLogger(LoggerInterface $logger): self
+    {
+        $this->logger = $logger;
+        return $this;
+    }
+
+    /**
+     * Send email message
+     *
+     * @throws ConnectionException
+     * @throws ApiException
+     */
     public function send(RawMessage $message, Envelope $envelope = null): ?SentMessage
     {
-        try{
-            $urlToSend = $this->getEndpoint();
-            $email = MessageConverter::toEmail($message);
-            $data = $this->getPayload($email,$envelope);
-            $data["from"] = $this->getFrom($message);
-            $response = $this->client->post($urlToSend,[ 'headers' => [
-                'Authorization' =>  $this->apikey,
-                'Accept' => 'application/json',
-                'Content-Type' => 'application/json',
-                'user-agent' => 'Laravel'
-            ],
-            'json' => $data]);
-        } catch (ConnectException $e) {
-            Log::error('Connection error: ' . $e->getMessage());
-            throw new \RuntimeException('Failed to connect to mail server.', 0, $e);
+        $email = MessageConverter::toEmail($message);
+        $payload = $this->buildPayload($email, $envelope);
 
-        } catch (RequestException $e) {
-            if ($e->hasResponse()) {
-                $statusCode = $e->getResponse()->getStatusCode();
-                $errorBody = $e->getResponse()->getBody()->getContents();
-                Log::error("Mail API error: HTTP $statusCode", ['response' => $errorBody]);
-                throw new \RuntimeException("Mail API error: $errorBody", 0, $e);
-            } else {
-                Log::error('Request error: ' . $e->getMessage());
-                throw new \RuntimeException('Mail request failed.', 0, $e);
+        $this->log('info', 'Sending email via ZeptoMail', [
+            'subject' => $email->getSubject(),
+            'to' => $this->extractAddresses($email->getTo()),
+        ]);
+
+        try {
+            $response = $this->client->post($this->endpoint, [
+                'headers' => $this->getHeaders(),
+                'json' => $payload,
+            ]);
+
+            $statusCode = $response->getStatusCode();
+            $responseBody = (string) $response->getBody();
+
+            if ($statusCode >= 200 && $statusCode < 300) {
+                $this->log('info', 'Email sent successfully', [
+                    'status_code' => $statusCode,
+                    'response' => $this->parseResponse($responseBody),
+                ]);
+
+                return new SentMessage($message, $envelope);
             }
 
-        } catch (\Throwable $e) {
-            Log::error('Unexpected error: ' . $e->getMessage());
-            throw new \RuntimeException('An unexpected error occurred while sending mail.', 0, $e);
+            // API returned error
+            $errorData = $this->parseResponse($responseBody);
+            $errorMessage = $errorData['message'] ?? $errorData['error'] ?? 'Unknown API error';
+
+            $this->log('error', 'ZeptoMail API error', [
+                'status_code' => $statusCode,
+                'error' => $errorMessage,
+                'response' => $errorData,
+            ]);
+
+            throw new ApiException(
+                "ZeptoMail API error: {$errorMessage}",
+                $statusCode,
+                $responseBody
+            );
+        } catch (GuzzleConnectException $e) {
+            $this->log('error', 'Failed to connect to ZeptoMail API', [
+                'error' => $e->getMessage(),
+                'endpoint' => $this->endpoint,
+            ]);
+
+            throw new ConnectionException(
+                'Failed to connect to ZeptoMail API: ' . $e->getMessage(),
+                0,
+                $e
+            );
+        } catch (RequestException $e) {
+            $statusCode = $e->hasResponse() ? $e->getResponse()->getStatusCode() : 0;
+            $responseBody = $e->hasResponse() ? (string) $e->getResponse()->getBody() : null;
+
+            $this->log('error', 'ZeptoMail request failed', [
+                'status_code' => $statusCode,
+                'error' => $e->getMessage(),
+                'response' => $responseBody,
+            ]);
+
+            throw new ApiException(
+                'ZeptoMail request failed: ' . $e->getMessage(),
+                $statusCode,
+                $responseBody,
+                $e
+            );
         }
-        
-        
-        return new SentMessage($message, $envelope);
     }
 
-    public function registerPlugin(Swift_Events_EventListener $plugin)
-    {
-        // No plugins needed
-    }
-    
+    /**
+     * Get transport name
+     */
     public function __toString(): string
     {
         return 'zeptomail';
     }
-    protected function getFrom(RawMessage $message): array
-    {
-        $from = $message->getFrom();
 
-        if (count($from) > 0) {
-            return ['name' => $from[0]->getName(), 'address' => $from[0]->getAddress()];
+    /**
+     * Validate API key
+     *
+     * @throws ConfigurationException
+     */
+    protected function validateApiKey(string $apiKey): void
+    {
+        if (empty($apiKey)) {
+            throw new ConfigurationException('ZeptoMail API key is required');
         }
 
-        return ['email' => '', 'name' => ''];
+        if (strlen($apiKey) < 10) {
+            throw new ConfigurationException('Invalid ZeptoMail API key format');
+        }
     }
-    /**
-     * @return string|null
-     */
-    private function getEndpoint(): ?string
-    {
 
-        return "https://zeptomail.".$this->domainMapping[$this->host].'/v1.1/email';
-    }
-        /**
-     * @param Email $email
-     * @param Envelope $envelope
-     * @return array
+    /**
+     * Resolve endpoint URL from region or custom endpoint
+     *
+     * @throws ConfigurationException
      */
-    private function getPayload(Email $email, Envelope $envelope): array
+    protected function resolveEndpoint(
+        ?string $region,
+        ?string $customEndpoint,
+        ?string $apiVersion,
+        ?array $regionDomains
+    ): string {
+        $apiVersion = $apiVersion ?? 'v1.1';
+
+        // Custom endpoint takes precedence
+        if ($customEndpoint) {
+            return rtrim($customEndpoint, '/') . "/{$apiVersion}/email";
+        }
+
+        // Use region mapping
+        $region = $region ?? 'us';
+        $regionDomains = $regionDomains ?? [
+            'us' => 'com',
+            'eu' => 'eu',
+            'in' => 'in',
+            'au' => 'com.au',
+            'jp' => 'jp',
+            'ca' => 'ca',
+            'sa' => 'sa',
+            'cn' => 'com.cn',
+        ];
+
+        if (!isset($regionDomains[$region])) {
+            throw new ConfigurationException("Invalid ZeptoMail region: {$region}");
+        }
+
+        $domain = $regionDomains[$region];
+
+        return "https://api.zeptomail.{$domain}/{$apiVersion}/email";
+    }
+
+    /**
+     * Get request headers
+     */
+    protected function getHeaders(): array
+    {
+        return [
+            'Authorization' => $this->apiKey,
+            'Accept' => 'application/json',
+            'Content-Type' => 'application/json',
+            'User-Agent' => 'Laravel-ZeptoMail/2.0',
+        ];
+    }
+
+    /**
+     * Build API payload from email
+     */
+    protected function buildPayload(Email $email, ?Envelope $envelope): array
     {
         $recipients = $this->getRecipients($email, $envelope);
-        $toaddress = $this->getEmailDetailsByType($recipients,'to');
-        $ccaddress = $this->getEmailDetailsByType($recipients,'cc');
-        $bccaddress = $this->getEmailDetailsByType($recipients,'bcc');
-        $attachmentJSONArr = array();
+
         $payload = [
-            
-            'subject' => $email->getSubject()
+            'from' => $this->formatAddress($email->getFrom()[0] ?? null),
+            'to' => $this->filterRecipientsByType($recipients, 'to'),
+            'subject' => $email->getSubject(),
         ];
-        if($email->getHtmlBody() != null) {
+
+        // Add HTML or text body
+        if ($email->getHtmlBody()) {
             $payload['htmlbody'] = $email->getHtmlBody();
-        }
-        else {
-            $payload['htmlbody'] = $email->getTextBody();
-        }
-       
-        
-        if(isset($toaddress) && !empty($toaddress)) {
-            $payload['to'] =$toaddress;
-        }
-        if(isset($ccaddress) && !empty($ccaddress)) {
-            $payload['cc'] =$ccaddress;
-        }
-        if(isset($bccaddress) && !empty($bccaddress)) {
-            $payload['bcc'] =$bccaddress;
+        } elseif ($email->getTextBody()) {
+            $payload['textbody'] = $email->getTextBody();
         }
 
-        
-
-        foreach ($email->getAttachments() as $attachment) {
-            
-            $headers = $attachment->getPreparedHeaders();
-            $disposition = $headers->getHeaderBody('Content-Disposition');
-            $filename = $headers->getHeaderParameter('Content-Disposition', 'filename');
-
-            $att = [
-                'content' => base64_encode($attachment->getBody()),
-                'name' => $filename,
-                'mime_type' => $headers->get('Content-Type')->getBody()
-              ];
-
-            if ($name = $headers->getHeaderParameter('Content-Disposition', 'name')) {
-                $att['name'] = $name;
-            }
-
-            $attachmentJSONArr[] = $att;
+        // Add CC recipients
+        $cc = $this->filterRecipientsByType($recipients, 'cc');
+        if (!empty($cc)) {
+            $payload['cc'] = $cc;
         }
-        if(isset($attachmentJSONArr)) {
-            $payload['attachments'] = $attachmentJSONArr;
+
+        // Add BCC recipients
+        $bcc = $this->filterRecipientsByType($recipients, 'bcc');
+        if (!empty($bcc)) {
+            $payload['bcc'] = $bcc;
         }
-        
+
+        // Add reply-to
+        $replyTo = $email->getReplyTo();
+        if (!empty($replyTo)) {
+            $payload['reply_to'] = $this->formatAddresses($replyTo);
+        }
+
+        // Add attachments
+        $attachments = $this->buildAttachments($email);
+        if (!empty($attachments)) {
+            $payload['attachments'] = $attachments;
+        }
 
         return $payload;
     }
-      /**
-     * @param Email $email
-     * @param Envelope $envelope
-     * @return array
+
+    /**
+     * Get all recipients with their types
      */
-    protected function getRecipients(Email $email, Envelope $envelope): array
+    protected function getRecipients(Email $email, ?Envelope $envelope): array
     {
         $recipients = [];
+        $envelopeRecipients = $envelope ? $envelope->getRecipients() : [];
 
-        foreach ($envelope->getRecipients() as $recipient) {
+        foreach ($envelopeRecipients as $recipient) {
             $type = 'to';
 
-            if (\in_array($recipient, $email->getBcc(), true)) {
+            if (in_array($recipient, $email->getBcc(), true)) {
                 $type = 'bcc';
-            } elseif (\in_array($recipient, $email->getCc(), true)) {
+            } elseif (in_array($recipient, $email->getCc(), true)) {
                 $type = 'cc';
             }
 
-            $recipientPayload = [
-                'email' => $recipient->getAddress(),
+            $recipients[] = [
+                'address' => $recipient,
                 'type' => $type,
             ];
+        }
 
-            if ('' !== $recipient->getName()) {
-                $recipientPayload['name'] = $recipient->getName();
+        // Fallback to email recipients if envelope is empty
+        if (empty($recipients)) {
+            foreach ($email->getTo() as $address) {
+                $recipients[] = ['address' => $address, 'type' => 'to'];
             }
-
-            $recipients[] = $recipientPayload;
+            foreach ($email->getCc() as $address) {
+                $recipients[] = ['address' => $address, 'type' => 'cc'];
+            }
+            foreach ($email->getBcc() as $address) {
+                $recipients[] = ['address' => $address, 'type' => 'bcc'];
+            }
         }
 
         return $recipients;
     }
-    protected function getEmailDetailsByType(array $recipients,string $type): array
+
+    /**
+     * Filter recipients by type and format for API
+     */
+    protected function filterRecipientsByType(array $recipients, string $type): array
     {
-        $sendmailaddress = [];
-        foreach ($recipients as $recipient) {
-            if($type === $recipient['type']){
-                $emailDetail = [
-                    'address' => $recipient['email']
-                    ];
-                if(isset($recipient['name'])) {
-                    $emailDetail['name'] = $recipient['name'];
-                }
-                $emailDetails = ['email_address' =>$emailDetail];
-                $sendmailaddress[] = $emailDetails;
-            }
-           
-        }
-        return $sendmailaddress;
+        $filtered = array_filter($recipients, fn($r) => $r['type'] === $type);
+
+        return array_map(function ($recipient) {
+            return [
+                'email_address' => $this->formatAddress($recipient['address']),
+            ];
+        }, array_values($filtered));
     }
 
-    public $domainMapping = [
-		"zoho.com"          => "zoho.com",
-		"zoho.eu"           => "zoho.eu", 
-		"zoho.in"           => "zoho.in", 
-		"zoho.com.cn"       => "zoho.com.cn",
-		"zoho.com.au"       => "zoho.com.au",
-		"zoho.jp"           => "zoho.jp",
-		"zohocloud.ca"      => "zohocloud.ca",
-		"zoho.sa"           => "zoho.sa"
-    ];
+    /**
+     * Format single address for API
+     */
+    protected function formatAddress(?Address $address): array
+    {
+        if (!$address) {
+            return ['address' => '', 'name' => ''];
+        }
 
+        $formatted = ['address' => $address->getAddress()];
 
+        if ($name = $address->getName()) {
+            $formatted['name'] = $name;
+        }
+
+        return $formatted;
+    }
+
+    /**
+     * Format multiple addresses for API
+     */
+    protected function formatAddresses(array $addresses): array
+    {
+        return array_map(fn($addr) => $this->formatAddress($addr), $addresses);
+    }
+
+    /**
+     * Build attachments array for API
+     */
+    protected function buildAttachments(Email $email): array
+    {
+        $attachments = [];
+
+        foreach ($email->getAttachments() as $attachment) {
+            $headers = $attachment->getPreparedHeaders();
+            $filename = $headers->getHeaderParameter('Content-Disposition', 'filename');
+            $contentType = $headers->get('Content-Type')?->getBody() ?? 'application/octet-stream';
+
+            $attachments[] = [
+                'content' => base64_encode($attachment->getBody()),
+                'name' => $filename ?? 'attachment',
+                'mime_type' => $contentType,
+            ];
+        }
+
+        return $attachments;
+    }
+
+    /**
+     * Extract email addresses from Address array
+     */
+    protected function extractAddresses(array $addresses): array
+    {
+        return array_map(fn(Address $addr) => $addr->getAddress(), $addresses);
+    }
+
+    /**
+     * Parse API response
+     */
+    protected function parseResponse(string $responseBody): array
+    {
+        $decoded = json_decode($responseBody, true);
+
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            return ['raw' => $responseBody];
+        }
+
+        return $decoded ?? [];
+    }
+
+    /**
+     * Log message if logging is enabled
+     */
+    protected function log(string $level, string $message, array $context = []): void
+    {
+        if (!$this->loggingEnabled) {
+            return;
+        }
+
+        if ($this->logger) {
+            $this->logger->log($level, "[ZeptoMail] {$message}", $context);
+        } elseif (class_exists(Log::class)) {
+            Log::log($level, "[ZeptoMail] {$message}", $context);
+        }
+    }
 }
